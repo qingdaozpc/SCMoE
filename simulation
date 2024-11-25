@@ -1,0 +1,380 @@
+# define the soft-thresholding function
+soft <- function(A, threshold){
+  S <- A
+  S[which(abs(S) <= threshold)] <- 0
+  S[which(S > threshold)] <- S[which(S > threshold)] - threshold
+  S[which(S < -threshold)] <- S[which(S < -threshold)] + threshold
+  return(S)
+}
+
+# define the pmf for MoE model
+MoE_pmf <- function(y1, y2, pi, lambda, alpha, theta){
+  pmf_vec = pi * dpois(y1 - 1, lambda) * 
+    dgamma(y2, shape = alpha, rate = theta)
+  return(sum(pmf_vec))
+}
+
+# define the log-likelihood function for MoE model
+MoE_loglik <- function(count, size, X, Z, beta, delta, lambda, alpha, theta){
+  pi.mat = exp(X %*% beta + Z %*% delta)/apply(exp(X %*% beta + Z %*% delta), 1, sum)
+  sum(sapply(1:nrow(X), function(i) 
+    log(MoE_pmf(count[i], size[i], pi.mat[i,], lambda, alpha, theta))))
+}
+
+# define the objective function for MoE model
+obj_loglik <- function(count, size, X, Z, beta, delta, lambda, alpha, theta, v){
+  v <- c(v,0)
+  pi.mat = exp(X %*% beta + Z %*% delta)/apply(exp(X %*% beta + Z %*% delta), 1, sum)
+  sum(sapply(1:nrow(X), function(i) 
+    log(MoE_pmf(count[i], size[i], pi.mat[i,], lambda, alpha, theta))))-
+    sum(sweep(abs(Hmat%*%delta),2,v,"*"))
+}
+
+# define the MM for the proposed MOE model --------
+MoE_MM <- function(count, size, X, g = 2, control.MM = list(maxit = 20, tol = 0.01)){
+  # count: claim count
+  # size: claim size
+  # X: design matrix m*p
+  # Z: one hot for spatial matrix m*L
+  m <- nrow(X) # the number of samples
+  p <- ncol(X) # the number of covariates
+  
+  # Initialization with true parameters
+  beta.mat <- rbind(beta.true,delta.true)
+  lambda <- lambda.true
+  alpha <- alpha.true
+  theta <- theta.true
+
+  ## stopping criteria for MM
+  MMmaxiters = control.MM$maxit # Maximum number of iterations for MM
+  tol.MM = control.MM$tol # tolerance for MM
+  
+  # MM algorithm starts -----------------------------------------------------------
+  
+  # log-likelihood function for MoE
+  loglik <- MoE_loglik(count = count, size = size, X = X, 
+                       beta = beta.mat, lambda = lambda, 
+                       alpha = alpha, theta = theta)
+  MM.loglik.trace <- c()
+  ite = 0 # Number of iterations of the MM algorithm
+  dif = 1
+  pi.mat <- matrix(0, nrow = m, ncol = g) # Weighting Matrix 
+  fy1.mat <- fy2.mat <- matrix(0, nrow = m, ncol = g) # Probability/Density Functions for each Component
+  
+  while (abs(dif) > tol.MM){
+    # Minorization step
+    # posterior expectation of u: m*g
+    for (k in 1:g){
+      fy1.mat[,k] <- dpois(count - 1, lambda[k])
+      fy2.mat[,k] <- dgamma(size, shape = alpha[k], rate = theta[k])
+    }
+    fy.mat <- fy1.mat * fy2.mat # joint density function of y1 and y2
+    pi.mat <- exp(X %*% beta.mat)/(apply(exp(X %*% beta.mat), 1, sum))
+    u.mat <- pi.mat * fy.mat/(apply(pi.mat * fy.mat, 1, sum)) 
+    
+    # Maximization step
+    # 1. update the parameters beta using Newton-Raphson method
+    # update beta: p*g, pi.mat: m*g
+    for (k in 1:(g-1)){
+      pi.mat <- exp(X %*% beta.mat)/(apply(exp(X %*% beta.mat), 1, sum))
+      # score function
+      Ub <- t(X) %*% (u.mat[ ,k] - pi.mat[ ,k])
+      # hessian matrix
+      Hb <- - t(X) %*% (pi.mat[ ,k] * (1 - pi.mat[ ,k]) * X)
+      beta.mat[ ,k] <- beta.mat[ ,k] - solve(Hb, Ub)
+    }
+    
+    # update the parameter lambda
+    lambda = apply(u.mat * count, 2, sum)/apply(u.mat, 2, sum) - 1
+    
+    # update the parameter alpha, theta
+    for (k in 1:g){
+      theta[k] = alpha[k] * sum(u.mat[ ,k])/sum(u.mat[ ,k] * size)
+      U = sum(u.mat[ ,k] * (log(theta[k]) + log(size) - digamma(alpha[k])))
+      H = -sum(u.mat[ ,k]) * trigamma(alpha[k])
+      alpha[k] = alpha[k] - U/H
+      theta[k] = alpha[k] * sum(u.mat[ ,k])/sum(u.mat[ ,k] * size)
+    }
+    
+    # update the likelihood
+    loglik_new <- MoE_loglik(count = count, size = size, X = X, 
+                             beta = beta.mat, lambda = lambda, 
+                             alpha = alpha, theta = theta)
+    MM.loglik.trace[ite] <- loglik_new
+    dif = loglik_new - loglik
+    loglik <- loglik_new
+    ite = ite + 1
+    
+    if(ite > MMmaxiters) break
+  }
+  return(list(beta = beta.mat,
+              lambda = lambda, 
+              alpha = alpha, 
+              theta = theta,
+              MM.loglik.trace = MM.loglik.trace,
+              MM.loglik = loglik
+  ))
+}
+
+# define the MM for the proposed SCMoE model --------
+SCMoE_MM <- function(count, size, X, Z, para, Hmat, g = 2, v = 1, rho = 1, 
+                     control.admm = list(tol.primal = 0.01, 
+                                         num.print = 5, 
+                                         tol.dual = 0.01, 
+                                         maxit = 10),
+                     control.NR = list(tol = 0.01),
+                     control.MM = list(maxit = 20, tol = 0.001)){
+  # count: claim count
+  # size: claim size
+  # X: design matrix m*p
+  # Z: one hot for spatial matrix m*L
+  # Hmat: D*L matrix constructed from edge set E with D edges, L denotes the number of locations
+  m <- nrow(X) # the number of samples
+  p <- ncol(X) # the number of covariates
+  D <- nrow(Hmat) # the number of edges
+  L <- ncol(Hmat) # the number of locations
+  
+  ## Initialization with true parameters
+  beta.mat <- para$beta #p*g
+  delta.mat <- para$delta #L*g 
+  lambda <- para$lambda
+  alpha <- para$alpha
+  theta <- para$theta
+  
+  ## stopping criteria for MM
+  MMmaxiters = control.MM$maxit # Maximum number of iterations for MM
+  tol.MM = control.MM$tol # tolerance for MM
+  tol.NR = control.NR$tol # tolerance for NR
+  tol.primal = control.admm$tol.primal # tolerance for primal residual
+  tol.dual = control.admm$tol.dual # tolerance for dual residual
+  
+  # MM algorithm starts -----------------------------------------------------------
+  
+  
+  # auxiliary variables initialization for ADMM
+  # eta.mat <- r.mat <- Hmat%*%delta.mat #D*g
+  eta.mat <- r.mat <- matrix(rnorm(D*(g-1), mean=0, sd=0.01), D, g-1)
+  
+  # log-likelihood function for MoE
+  obj.loglik <- obj_loglik(count = count, size = size, X = X, Z = Z,
+                           beta = beta.mat, delta = delta.mat, 
+                           lambda = lambda, alpha = alpha, theta = theta, v = v)
+  MM.loglik.trace <- c()
+  ite = 0 # Number of iterations of the MM algorithm
+  dif = 1
+  pi.mat <- matrix(0, nrow = m, ncol = g) # Weighting Matrix 
+  fy1.mat <- fy2.mat <- matrix(0, nrow = m, ncol = g) # Probability/Density Functions for each Component
+  
+  while (abs(dif) > tol.MM){
+    # Minorization step
+    # posterior expectation of u: m*g
+    for (k in 1:g){
+      fy1.mat[,k] <- dpois(count - 1, lambda[k])
+      fy2.mat[,k] <- dgamma(size, shape = alpha[k], rate = theta[k])
+    }
+    fy.mat <- fy1.mat * fy2.mat # joint density function of y1 and y2
+    pi.mat <- exp(X %*% beta.mat + Z %*% delta.mat)/(apply(exp(X %*% beta.mat + Z %*% delta.mat), 1, sum))
+    u.mat <- pi.mat * fy.mat/(apply(pi.mat * fy.mat, 1, sum)) #
+    
+    # Maximization step
+    # 1. update the parameters beta using Newton-Raphson method
+    # update beta: p*g, pi.mat: m*g
+    for (k in 1:(g-1)){
+      pi.mat <- exp(X %*% beta.mat + Z %*% delta.mat)/
+        (apply(exp(X %*% beta.mat + Z %*% delta.mat), 1, sum))
+      # score function
+      Ub <- t(X) %*% (u.mat[ ,k] - pi.mat[ ,k])
+      # hessian matrix
+      Hb <- -t(X) %*% (pi.mat[ ,k] * (1 - pi.mat[ ,k]) * X)
+      beta.mat[ ,k] <- beta.mat[ ,k] - solve(Hb, Ub)
+    }
+    
+    # 2. update the parameters delta using ADMM algorithm
+    for (k in 1:(g-1)){
+      pi.mat <- exp(X %*% beta.mat + Z %*% delta.mat)/
+        (apply(exp(X %*% beta.mat + Z %*% delta.mat), 1, sum))
+      repeat{
+        current.r <- r.mat
+        current.eta <- eta.mat
+        r.vec <- current.r[, k]
+        eta.vec <- current.eta[, k]
+        # update delta
+        repeat{
+          current.delta <- delta.mat
+          pi.mat <- exp(X %*% beta.mat + Z %*% current.delta)/
+            (apply(exp(X %*% beta.mat + Z %*% current.delta), 1, sum))
+          delta.vec <- current.delta[ ,k]
+          # score function
+          Ud <- t(Z) %*% (u.mat[ ,k] - pi.mat[ ,k]) - rho*t(Hmat) %*% (Hmat%*%delta.vec - eta.vec + r.vec)
+          # hessian matrix
+          Hd <- -t(Z) %*% (pi.mat[ ,k] * (1 - pi.mat[ ,k]) * Z) - rho*t(Hmat) %*% Hmat
+          delta.mat[ ,k] <- delta.vec - solve(Hd, Ud)
+          res.NR <- norm(delta.mat[ ,k] - current.delta[,k], type = '2') # the changing of auxiliary variables
+          if(res.NR < tol.NR) break
+        }
+        # update eta and r
+        eta.mat[,k] <- soft(A = Hmat%*%delta.mat[,k] + r.vec, threshold = v[k]/rho)
+        r.mat[,k] <- r.vec + Hmat%*%delta.mat[,k] - eta.mat[,k]
+        res.primal <- norm(r.mat[,k] - current.r[,k], type = '2') # difference between auxiliary variables and the beta's
+        res.dual <- norm(rho*t(Hmat)%*%(eta.mat[,k] - current.eta[,k]), type = '2') # the changing of auxiliary variables
+        if((res.primal < tol.primal)&(res.dual < tol.dual)) break # end when little improvement
+      }
+    }
+    
+    # update the parameter lambda
+    lambda = apply(u.mat * count, 2, sum)/apply(u.mat, 2, sum) - 1
+    
+    # update the parameter alpha, theta
+    for (k in 1:g){
+      theta[k] = alpha[k] * sum(u.mat[ ,k])/sum(u.mat[ ,k] * size)
+      U = sum(u.mat[ ,k] * (log(theta[k]) + log(size) - digamma(alpha[k])))
+      H = -sum(u.mat[ ,k]) * trigamma(alpha[k])
+      alpha[k] = alpha[k] - U/H
+      theta[k] = alpha[k] * sum(u.mat[ ,k])/sum(u.mat[ ,k] * size)
+    }
+    
+    # update the likelihood
+    obj.loglik.new <- obj_loglik(count = count, size = size, X = X, Z = Z,
+                                 beta = beta.mat, delta = delta.mat, 
+                                 lambda = lambda, alpha = alpha, theta = theta, v = v)
+    
+    MM.loglik.trace[ite] <- obj.loglik.new
+    dif = obj.loglik.new - obj.loglik
+    obj.loglik <- obj.loglik.new
+    ite = ite + 1
+    
+    if(ite > MMmaxiters) break
+  }
+  obj.loglik <- obj_loglik(count = count, size = size, X = X, Z = Z,
+                           beta = beta.mat, delta = delta.mat, 
+                           lambda = lambda, alpha = alpha, theta = theta, v = v)
+  return(list(beta = beta.mat,
+              delta = delta.mat,
+              lambda = lambda, 
+              alpha = alpha, 
+              theta = theta,
+              r = r.mat, 
+              eta = eta.mat,
+              MM.loglik.trace = MM.loglik.trace,
+              obj.loglik = obj.loglik
+  ))
+}
+
+
+#simulation 1
+library(igraph)
+set.seed(1)
+graph <- graph("Levi")
+plot(graph, layout = layout_with_fr(graph))
+L <- vcount(graph)
+D <- ecount(graph)
+edgemat <- as_edgelist(graph)
+Hmat <- matrix(0, nrow = nrow(edgemat),  ncol = length(graph))
+for(i in 1:nrow(Hmat)){
+  Hmat[i, edgemat[i,1]] <- 1
+  Hmat[i, edgemat[i,2]] <- -1
+}
+clusters <- cluster_spinglass(graph,spins=3)
+membership <- membership(clusters)
+# 根据聚类结果对节点进行着色
+node_colors <- rainbow(max(membership))
+# 绘制图并着色
+set.seed(1)
+plot(graph, layout = layout_with_fr(graph), vertex.color = node_colors[membership])
+
+
+g <- 2
+p <- 2
+lambda.true <- c(0.1, 0.2)
+alpha.true <- c(1, 2)
+theta.true <- c(2, 1)
+beta.true <- matrix(c(1,-1,rep(0,p)), nrow = p, ncol = g) #p*g
+mean <- c(-1,0,1)
+v_vec <- 0:3
+R <- 100 #number of replication
+I <- length(v_vec)
+
+ 
+Simulation<- function(m=5000, m.test=5000, s=0.1){
+  set.seed(12)
+  delta.true <- matrix(c(rnorm(L,mean=mean[membership], sd=s),
+                         rep(0,L)), nrow = L, ncol = g) #L*g 
+  para.true <- list(beta=beta.true,delta=delta.true,lambda=lambda.true,
+                    alpha=alpha.true,theta=theta.true)
+  para0 <- c(beta.true,delta.true,lambda.true,alpha.true,theta.true)
+  X.test <- cbind(rnorm(m.test),rbinom(m.test,1,0.5))
+  Z.test <- t(rmultinom(m.test,1,prob=rep(1/L,L)))
+  Umat<-apply(exp(X.test%*%beta.true+Z.test%*%delta.true), 1, function(prob) rmultinom(1, 1, prob))
+  u<-apply(Umat, 2, function(vec) which(vec==1))
+  test.count <- rpois(m.test,lambda.true[u])+1
+  test.size <- rgamma(m.test,shape=alpha.true[u],rate=theta.true[u])
+  sse.mat <- matrix(0,I,R)
+  loglik.mat <- matrix(0,I,R)
+  par.mat <- array(0,c(I,R,length(para0)))
+  for (r in 1:R){
+    X <- cbind(rnorm(m),rbinom(m,1,0.5))
+    Z <- t(rmultinom(m,1,prob=rep(1/L,L)))
+    Umat<-apply(exp(X%*%beta.true+Z%*%delta.true), 1, function(prob) rmultinom(1, 1, prob))
+    u<-apply(Umat, 2, function(vec) which(vec==1))
+    count <- rpois(m,lambda.true[u])+1
+    size <- rgamma(m,shape=alpha.true[u],rate=theta.true[u])
+    for (i in 1:I){
+      scmoe <- SCMoE_MM(count = count, size = size, X = X, Z = Z, para=para.true,
+                         g = 2, Hmat = Hmat, v = v_vec[i], rho = 0.1, 
+                         control.admm = list(tol.primal = 0.1, 
+                                             num.print = 5, 
+                                             tol.dual = 0.1, 
+                                             maxit = 1000),
+                         control.NR = list(tol = 0.1),
+                         control.MM = list(maxit = 1000, tol = 0.001))
+      para <- c(scmoe$beta,scmoe$delta,scmoe$lambda,scmoe$alpha,scmoe$theta)
+      par.mat[i,r,] <- para
+      sse.mat[i,r] <- sum((para-para0)^2)
+      loglik.mat[i,r] <- MoE_loglik(count = test.count, size = test.size, X = X.test, Z = Z.test, 
+                            beta = scmoe$beta, delta = scmoe$delta, 
+                            lambda = scmoe$lambda, alpha = scmoe$alpha, theta = scmoe$theta)
+    }
+    
+  }
+  return(list(sse=sse.mat,logik=loglik.mat, par=par.mat))
+}
+ 
+
+result1 <- Simulation(m=5000, m.test=5000, s=0.1)
+result2 <- Simulation(m=5000, m.test=5000, s=0.5)
+result3 <- Simulation(m=5000, m.test=5000, s=1)
+
+result4 <- Simulation(m=2000, m.test=5000, s=0.5)
+result5 <- Simulation(m=5000, m.test=5000, s=0.5)
+result6 <- Simulation(m=10000, m.test=5000, s=0.5)
+
+opar <- par(no.readonly = T)
+par(mfrow=c(1,2))
+boxplot(result1$sse[1,],result1$sse[2,],result1$sse[3,],result1$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result1$logik[1,],result1$logik[2,],result1$logik[3,],result1$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result2$sse[1,],result2$sse[2,],result2$sse[3,],result2$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result2$logik[1,],result2$logik[2,],result2$logik[3,],result2$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result3$sse[1,],result3$sse[2,],result3$sse[3,],result3$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result3$logik[1,],result3$logik[2,],result3$logik[3,],result3$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result4$sse[1,],result4$sse[2,],result4$sse[3,],result4$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result4$logik[1,],result4$logik[2,],result4$logik[3,],result4$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result5$sse[1,],result5$sse[2,],result5$sse[3,],result5$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result5$logik[1,],result5$logik[2,],result5$logik[3,],result5$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result6$sse[1,],result6$sse[2,],result6$sse[3,],result6$sse[4,],ylab="SSE",
+        names =c("v=0","v=1","v=2","v=3"))
+boxplot(result6$logik[1,],result6$logik[2,],result6$logik[3,],result6$logik[4,],ylab="test.loglik",
+        names =c("v=0","v=1","v=2","v=3"))
+
+par(opar)
+
+
